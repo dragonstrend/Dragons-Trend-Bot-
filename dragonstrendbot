@@ -1,0 +1,385 @@
+#!/usr/bin/env python3
+"""
+Dragons Trend Voting Bot
+- Require users to join the channel before voting
+- Register projects by contract address (per chain)
+- Verify contract address format (and optionally verify on-chain if API keys provided)
+- Persist projects and votes to SQLite
+- Auto-post leaderboard every 4 hours and reset votes
+"""
+
+import os
+import re
+import sqlite3
+import logging
+import asyncio
+from datetime import datetime
+
+import requests
+from dotenv import load_dotenv
+from telegram import Update, ParseMode
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    ContextTypes,
+)
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+
+# --- Load config ---
+load_dotenv()
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+CHANNEL_ID = os.getenv("CHANNEL_ID")  # e.g. "@dragonstrend"
+# Optional: APIs for contract verification (if you have keys)
+ETHERSCAN_API_KEY = os.getenv("ETHERSCAN_API_KEY", "")  # for Ethereum verification (optional)
+SOLSCAN_API = os.getenv("SOLSCAN_API", "")  # e.g. "https://public-api.solscan.io" (optional)
+DATABASE_FILE = os.getenv("DATABASE_FILE", "dragonstrend.db")
+TIMEZONE = os.getenv("TIMEZONE", "UTC")
+
+if not BOT_TOKEN or not CHANNEL_ID:
+    raise RuntimeError("Please set BOT_TOKEN and CHANNEL_ID in your .env file")
+
+# --- Logging ---
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+# --- DB helpers ---
+def init_db():
+    conn = sqlite3.connect(DATABASE_FILE, check_same_thread=False)
+    cur = conn.cursor()
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS projects (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            chain TEXT NOT NULL,
+            contract TEXT NOT NULL UNIQUE,
+            group_link TEXT,
+            added_at TEXT
+        )
+        """
+    )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS votes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            voted_at TEXT,
+            UNIQUE(project_id, user_id),
+            FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
+        )
+        """
+    )
+    conn.commit()
+    return conn
+
+db = init_db()
+
+# --- Contract validation helpers ---
+ETH_REGEX = re.compile(r"^0x[a-fA-F0-9]{40}$")
+# Simple base58-ish pattern for Solana addresses (not perfect but practical)
+SOL_REGEX = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{32,44}$")
+
+def validate_contract_format(chain: str, contract: str) -> bool:
+    chain = chain.lower()
+    contract = contract.strip()
+    if chain in ("eth", "ethereum"):
+        return bool(ETH_REGEX.match(contract))
+    if chain in ("sol", "solana"):
+        return bool(SOL_REGEX.match(contract))
+    # Fallback: accept non-empty token-like strings (but warn)
+    return len(contract) > 5
+
+def verify_contract_onchain(chain: str, contract: str) -> bool:
+    """
+    Optional: try to verify contract existence by calling a public API if configured.
+    Returns True if verification succeeded, False otherwise.
+    This function will try Etherscan (ETH) or Solscan (SOL) if API/URL provided.
+    If no API configured, it will simply return True (format-checked) so addproject works offline.
+    """
+    chain = chain.lower()
+    contract = contract.strip()
+    try:
+        if chain in ("eth", "ethereum") and ETHERSCAN_API_KEY:
+            # Use Etherscan getabi to check contract existence
+            url = (
+                "https://api.etherscan.io/api"
+                f"?module=contract&action=getabi&address={contract}&apikey={ETHERSCAN_API_KEY}"
+            )
+            r = requests.get(url, timeout=8)
+            if r.status_code == 200:
+                data = r.json()
+                # status 1 => success, result contains ABI
+                return data.get("status") == "1" and data.get("result") not in ("", "Contract source code not verified")
+            return False
+        if chain in ("sol", "solana") and SOLSCAN_API:
+            # Query Solscan account endpoint
+            url = f"{SOLSCAN_API}/account/tokens?account={contract}"
+            r = requests.get(url, timeout=8)
+            return r.status_code == 200
+    except Exception as e:
+        logger.warning("onchain verification failed: %s", e)
+    # If no API provided or verification failed, return True if format valid
+    return True
+
+# --- Bot utility DB functions ---
+def add_project_to_db(name: str, chain: str, contract: str, group_link: str = "") -> (bool, str):
+    if not validate_contract_format(chain, contract):
+        return False, "Contract address format seems invalid for the specified chain."
+
+    # optionally verify onchain if configured
+    ok = verify_contract_onchain(chain, contract)
+    if not ok:
+        return False, "Could not verify contract onchain (API check failed). You may still add using the correct flags."
+
+    try:
+        cur = db.cursor()
+        cur.execute(
+            "INSERT INTO projects (name, chain, contract, group_link, added_at) VALUES (?, ?, ?, ?, ?)",
+            (name.strip(), chain.strip().lower(), contract.strip(), group_link.strip(), datetime.utcnow().isoformat()),
+        )
+        db.commit()
+        return True, "Project added successfully."
+    except sqlite3.IntegrityError:
+        return False, "Project with this contract already exists."
+    except Exception as e:
+        logger.exception("add_project error:")
+        return False, str(e)
+
+def list_projects():
+    cur = db.cursor()
+    cur.execute("SELECT id, name, chain, contract, group_link, added_at FROM projects ORDER BY id DESC")
+    return cur.fetchall()
+
+def remove_project_by_contract(contract: str):
+    cur = db.cursor()
+    cur.execute("DELETE FROM projects WHERE contract = ?", (contract.strip(),))
+    removed = cur.rowcount
+    db.commit()
+    return removed > 0
+
+def get_project_by_contract(contract: str):
+    cur = db.cursor()
+    cur.execute("SELECT id, name, chain, contract, group_link FROM projects WHERE contract = ?", (contract.strip(),))
+    return cur.fetchone()
+
+def cast_vote(project_id: int, user_id: int) -> (bool, str):
+    cur = db.cursor()
+    try:
+        cur.execute(
+            "INSERT INTO votes (project_id, user_id, voted_at) VALUES (?, ?, ?)",
+            (project_id, user_id, datetime.utcnow().isoformat()),
+        )
+        db.commit()
+        return True, "Vote recorded."
+    except sqlite3.IntegrityError:
+        return False, "You already voted for this project in the current cycle."
+    except Exception as e:
+        logger.exception("cast_vote error:")
+        return False, str(e)
+
+def tally_votes():
+    cur = db.cursor()
+    cur.execute("""
+        SELECT p.name, p.chain, p.contract, p.group_link, COUNT(v.id) as votes
+        FROM projects p
+        LEFT JOIN votes v ON p.id = v.project_id
+        GROUP BY p.id
+        ORDER BY votes DESC, p.id ASC
+        LIMIT 50
+    """)
+    return cur.fetchall()
+
+def reset_votes():
+    cur = db.cursor()
+    cur.execute("DELETE FROM votes")
+    db.commit()
+
+# --- Telegram command handlers ---
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "🐉 Dragons Trend Voting Bot\n\n"
+        f"👉 You must join our channel before voting: {CHANNEL_ID}\n\n"
+        "Commands:\n"
+        "/projects - list registered projects\n"
+        "/addproject <name>|<chain>|<contract>|<group_link (optional)> - register a project (admin only)\n"
+        "/vote <contract> - vote for a project by contract address\n"
+        "/leaderboard - view current leaderboard\n"
+        "/postleaderboard - (admin) post leaderboard now\n"
+    )
+
+async def projects_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    rows = list_projects()
+    if not rows:
+        await update.message.reply_text("No projects registered yet. Admins can add projects with /addproject")
+        return
+    msg = "📦 *Registered Projects*\n\n"
+    for r in rows:
+        pid, name, chain, contract, group_link, added_at = r
+        msg += f"• *{name}* ({chain.upper()}) — `{contract}`\n"
+        if group_link:
+            msg += f"  Group: {group_link}\n"
+    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+
+async def addproject_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Basic admin check: user must be a channel admin to add a project
+    try:
+        user = update.effective_user
+        member = await context.bot.get_chat_member(CHANNEL_ID, user.id)
+        if member.status not in ("creator", "administrator"):
+            await update.message.reply_text("❌ Only channel admins may add projects.")
+            return
+    except Exception:
+        await update.message.reply_text("❌ Could not verify admin status. Make sure bot and you are in the channel.")
+        return
+
+    text = " ".join(context.args)
+    if not text:
+        await update.message.reply_text(
+            "Usage: /addproject <name>|<chain>|<contract>|<group_link (optional)>\n"
+            "Example: /addproject Gashy|sol|DokPYQ33...|https://t.me/gashygangs"
+        )
+        return
+
+    parts = [p.strip() for p in text.split("|")]
+    if len(parts) < 3:
+        await update.message.reply_text("Please provide at least name, chain, and contract separated by |")
+        return
+
+    name, chain, contract = parts[0], parts[1], parts[2]
+    group_link = parts[3] if len(parts) >= 4 else ""
+    ok, msg = add_project_to_db(name, chain, contract, group_link)
+    if ok:
+        await update.message.reply_text(f"✅ {msg}")
+    else:
+        await update.message.reply_text(f"❌ {msg}")
+
+async def removeproject_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # admin only
+    try:
+        user = update.effective_user
+        member = await context.bot.get_chat_member(CHANNEL_ID, user.id)
+        if member.status not in ("creator", "administrator"):
+            await update.message.reply_text("❌ Only channel admins may remove projects.")
+            return
+    except Exception:
+        await update.message.reply_text("❌ Could not verify admin status.")
+        return
+
+    if len(context.args) == 0:
+        await update.message.reply_text("Usage: /removeproject <contract>")
+        return
+    contract = context.args[0].strip()
+    removed = remove_project_by_contract(contract)
+    if removed:
+        await update.message.reply_text("✅ Project removed.")
+    else:
+        await update.message.reply_text("❌ Project not found.")
+
+async def vote_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if len(context.args) == 0:
+        await update.message.reply_text("Usage: /vote <contract>")
+        return
+    contract = context.args[0].strip()
+    proj = get_project_by_contract(contract)
+    if not proj:
+        await update.message.reply_text("❌ Project not found. Make sure contract is registered via /addproject.")
+        return
+
+    # verify user is a member of channel
+    try:
+        member = await context.bot.get_chat_member(CHANNEL_ID, user.id)
+        if member.status not in ("member", "administrator", "creator"):
+            await update.message.reply_text(f"❌ You must join {CHANNEL_ID} before voting.")
+            return
+    except Exception:
+        await update.message.reply_text("❌ Could not verify channel membership. Make sure bot is admin in the channel.")
+        return
+
+    project_id = proj[0]
+    ok, msg = cast_vote(project_id, user.id)
+    if ok:
+        await update.message.reply_text(f"✅ Vote recorded for *{proj[1]}* ({proj[2]})", parse_mode=ParseMode.MARKDOWN)
+    else:
+        await update.message.reply_text(f"❌ {msg}")
+
+async def leaderboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    rows = tally_votes()
+    if not rows:
+        await update.message.reply_text("📊 No votes yet this cycle.")
+        return
+    msg = f"🔥 *Dragons Trend Leaderboard* (cycle ends: every 4 hours)\n\n"
+    for i, r in enumerate(rows, 1):
+        name, chain, contract, group_link, votes_count = r
+        msg += f"{i}. *{name}* ({chain.upper()}) — {votes_count} votes\n"
+        msg += f"   `{contract}`\n"
+        if group_link:
+            msg += f"   {group_link}\n"
+    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+
+# Manual post leaderboard (admin-only)
+async def postleaderboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        user = update.effective_user
+        member = await context.bot.get_chat_member(CHANNEL_ID, user.id)
+        if member.status not in ("creator", "administrator"):
+            await update.message.reply_text("❌ Only channel admins may post the leaderboard.")
+            return
+    except Exception:
+        await update.message.reply_text("❌ Could not verify admin status.")
+        return
+    await do_auto_post(context)
+
+# Helper to compose and send leaderboard, then reset votes
+async def do_auto_post(context: ContextTypes.DEFAULT_TYPE):
+    rows = tally_votes()
+    if not rows:
+        await context.bot.send_message(CHANNEL_ID, "📊 No votes in the last 4 hours.")
+        return
+
+    msg = f"🔥 *Dragons Trend 4H Leaderboard* 🔥\n\n"
+    for i, r in enumerate(rows, 1):
+        name, chain, contract, group_link, votes_count = r
+        msg += f"{i}. *{name}* ({chain.upper()}) — {votes_count} votes\n"
+        msg += f"   `{contract}`\n"
+        if group_link:
+            msg += f"   {group_link}\n"
+    msg += f"\n_Cycle posted: {datetime.utcnow().isoformat()} UTC_"
+
+    await context.bot.send_message(CHANNEL_ID, msg, parse_mode=ParseMode.MARKDOWN)
+    # Reset votes for next cycle
+    reset_votes()
+
+# Scheduler job wrapper
+async def scheduled_job_wrapper(app: Application):
+    # The scheduler calls this; convert to Context-like object
+    class Ctx:
+        bot = app.bot
+    await do_auto_post(Ctx)
+
+# --- Main setup ---
+def main():
+    app = Application.builder().token(BOT_TOKEN).build()
+
+    app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(CommandHandler("projects", projects_command))
+    app.add_handler(CommandHandler("addproject", addproject_command))
+    app.add_handler(CommandHandler("removeproject", removeproject_command))
+    app.add_handler(CommandHandler("vote", vote_command))
+    app.add_handler(CommandHandler("leaderboard", leaderboard_command))
+    app.add_handler(CommandHandler("postleaderboard", postleaderboard_command))
+
+    # Scheduler - every 4 hours
+    scheduler = AsyncIOScheduler(timezone=TIMEZONE)
+    # pass application to the coroutine wrapper
+    scheduler.add_job(lambda: asyncio.create_task(scheduled_job_wrapper(app)), "interval", hours=4, next_run_time=None)
+    scheduler.start()
+
+    logger.info("Bot started. Scheduler running (4-hour cycles).")
+    app.run_polling()
+
+if __name__ == "__main__":
+    main()
